@@ -1,0 +1,22 @@
+##IMPORTANTE - SIN ESTO LA CONEXION NO FUNCIONA
+## CREA UN ARCHIVO .env EN LA MISMA CARPETA QUE INCLUYA:
+DATABASE_URL = postgresql://postgres.bxelbfnsugczmcfgltwm:Juansebaleslie2026@aws-1-eu-west-1.pooler.supabase.com:6543/postgres
+
+##Libreria para ver si existe el .env file en la carpeta
+import os
+print("DATABASE_URL existe?", bool(os.getenv("DATABASE_URL")))
+print(os.getenv("DATABASE_URL"))
+
+##Codigo en python/jupyter para establecer la conexion
+url = os.getenv("DATABASE_URL")
+p = urlparse(url)
+print("Conectando a:", p.hostname, p.port)
+
+conn = psycopg2.connect(url)
+cur = conn.cursor()
+cur.execute("SELECT current_user, inet_server_port(), now();")
+print("OK:", cur.fetchone())
+
+cur.close()
+conn.close()
+
