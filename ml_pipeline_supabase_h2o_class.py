@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
+import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -17,25 +19,24 @@ import h2o
 from h2o.automl import H2OAutoML
 
 
-
+# -----------------------------
 # Config
-
+# -----------------------------
 @dataclass(frozen=True)
 class PipelineConfig:
     """
     Configuración central del pipeline (Data Engineering + Data Science).
 
-    Esta clase agrupa todos los parámetros para que el pipeline sea:
-    - Reproducible (seed, splits, límites de AutoML).
-    - Fácil de ajustar (chunk_size, columnas, filtros SQL) sin tocar la lógica.
-    - Seguro en credenciales: DATABASE_URL se lee desde un .env y no se hardcodea.
+    Esta clase agrupa parámetros para que el pipeline sea reproducible, configurable y
+    seguro (sin credenciales hardcodeadas). Se usa como “single source of truth” para:
 
-    Componentes:
-    - Conexión: ruta del .env y clave de entorno.
-    - Fuente: tabla en Supabase/Postgres y PK para paginar.
-    - Ingesta por chunks: tamaño del batch y punto inicial.
-    - Modelado: target, features y configuración de H2O AutoML.
-    - SQL: columnas a extraer y filtros de calidad mínimos.
+    - Conexión a Supabase/Postgres mediante DATABASE_URL en un .env.
+    - Tabla fuente (ml_table) y columna PK (sale_id) para paginar por keyset.
+    - Ingesta incremental por chunks (tamaño y punto de inicio).
+    - Parámetros de H2O AutoML (memoria, seeds, tiempo, número de modelos).
+    - Definición de target, features y columnas categóricas.
+    - Filtros mínimos de calidad (WHERE) para construir el dataset de entrenamiento.
+    - Carpeta local para guardar artefactos (métricas, leaderboard, figuras, modelo).
     """
     # env
     env_path: str = ".env"
@@ -52,7 +53,7 @@ class PipelineConfig:
     # H2O / AutoML
     h2o_max_mem: str = "24G"
     seed: int = 42
-    split_train_valid: Tuple[float, float] = (0.7, 0.15)
+    split_train_valid: Tuple[float, float] = (0.7, 0.15)  # test = resto
     max_models: int = 15
     max_runtime_secs: int = 1800
     sort_metric: str = "RMSE"
@@ -76,7 +77,7 @@ class PipelineConfig:
         "listyear",
     )
 
-    # filtros 
+    # filtros mínimos de calidad
     where_filters: str = """
         saleamount IS NOT NULL
         AND assessedvalue IS NOT NULL
@@ -85,45 +86,41 @@ class PipelineConfig:
         AND listyear IS NOT NULL
     """
 
+    # carpeta para resultados/artefactos
+    output_dir: str = "artifacts"
 
 
+# -----------------------------
 # Pipeline
-
+# -----------------------------
 class MLPipeline:
     """
-    Pipeline end-to-end: Supabase (Postgres) -> ingesta incremental -> H2O AutoML -> evaluación.
+    Pipeline end-to-end para entrenamiento con H2O AutoML consultando Supabase/Postgres.
 
-    Qué hace (visión de ingeniería):
-    1) Lee DATABASE_URL desde .env (credenciales fuera del código).
-    2) Verifica conectividad a Supabase (consulta liviana).
-    3) Extrae datos desde public.ml_table en batches (chunks) usando keyset pagination:
-       - sale_id > last_sale_id
-       - ORDER BY sale_id
-       - LIMIT chunk_size
-       Esto evita la degradación típica de OFFSET en tablas grandes.
-    4) Importa cada chunk a H2O y lo acumula en un H2OFrame único (self.hf).
-       Los CSV se generan como temporales y se eliminan al terminar.
-    5) Feature engineering:
-       - Crea el target log: saleamount_log = log(saleamount + 1).
-       - Castea categorías (propertytype, residentialtype) a factor.
-    6) Split train/valid/test y entrenamiento con H2OAutoML.
-    7) Reporte de métricas en test (RMSE/MAE/R2 en escala log) + leaderboard.
-    8) Diagnóstico básico: scatter pred vs real (log) y variable importance del mejor GBM.
-
-
+    Resumen de etapas:
+    1) Carga DATABASE_URL desde .env (credenciales fuera del código).
+    2) Valida conexión a la base (sanity check).
+    3) Extrae datos en chunks desde la tabla fuente con keyset pagination por sale_id.
+    4) Importa cada chunk a H2O y lo concatena en un H2OFrame acumulado.
+    5) Aplica feature engineering mínimo:
+       - target log: log(saleamount + 1)
+       - casteo de categóricas a factor
+    6) Split train/valid/test.
+    7) Entrena AutoML y evalúa en test.
+    8) Genera y guarda artefactos (leaderboard, métricas, figuras, varimp, modelo líder).
     """
 
     def __init__(self, cfg: PipelineConfig):
         """
-        Inicializa el pipeline y reserva atributos que se llenan durante run().
+        Inicializa el pipeline y reserva atributos que se llenan durante la ejecución.
 
         Args:
-            cfg: instancia de PipelineConfig con parámetros de conexión, ingesta y modelado.
+            cfg: configuración del pipeline (conexión, columnas, chunks, AutoML y outputs).
         """
         self.cfg = cfg
         self.db_url: Optional[str] = None
 
-        # H2OFrame completo (acumulado) y splits
+        # Dataset acumulado y splits (H2OFrames)
         self.hf = None
         self.train = None
         self.valid = None
@@ -133,20 +130,68 @@ class MLPipeline:
         self.aml: Optional[H2OAutoML] = None
         self.leader = None
 
-    # Supabase connection helpers 
+    # -----------------------------
+    # Helpers de outputs (artefactos)
+    # -----------------------------
+    def _ensure_output_dir(self) -> str:
+        """
+        Crea (si no existe) la carpeta donde se guardan los artefactos del pipeline.
+
+        Returns:
+            Ruta a la carpeta de salida (cfg.output_dir).
+        """
+        out = self.cfg.output_dir
+        os.makedirs(out, exist_ok=True)
+        return out
+
+    def _safe_filename(self, name: str) -> str:
+        """
+        Normaliza nombres de archivo para que sean seguros en Windows y sistemas de archivos.
+
+        H2O genera model_id con caracteres como ':' que pueden causar problemas en paths.
+
+        Args:
+            name: nombre original (ej. model_id o filename).
+
+        Returns:
+            String con caracteres problemáticos reemplazados.
+        """
+        return (
+            str(name)
+            .replace(":", "_")
+            .replace("/", "_")
+            .replace("\\", "_")
+            .replace(" ", "_")
+        )
+
+    def _artifact_path(self, filename: str) -> str:
+        """
+        Construye una ruta absoluta/relativa a un archivo dentro de cfg.output_dir.
+
+        Args:
+            filename: nombre del archivo a guardar.
+
+        Returns:
+            Path completo (output_dir/filename normalizado).
+        """
+        out = self._ensure_output_dir()
+        return os.path.join(out, self._safe_filename(filename))
+
+    # -----------------------------
+    # Supabase/Postgres: conexión
+    # -----------------------------
     def load_env(self) -> str:
         """
         Carga el archivo .env y obtiene DATABASE_URL.
 
-        Motivación (DE/ops):
-        - Mantener credenciales fuera del repo/código.
-        - Facilitar ejecuciones en distintos entornos (local, docker, CI).
+        Motivo:
+        - Mantener credenciales fuera del código y del repositorio.
 
         Returns:
-            El DATABASE_URL leído del entorno.
+            DATABASE_URL como string.
 
         Raises:
-            RuntimeError: si no existe la variable DATABASE_URL en el .env.
+            RuntimeError: si DATABASE_URL no existe en el entorno.
         """
         load_dotenv(self.cfg.env_path)
         url = os.getenv(self.cfg.db_env_key)
@@ -157,13 +202,13 @@ class MLPipeline:
 
     def _connect(self):
         """
-        Abre una conexión psycopg2 a Supabase usando DATABASE_URL.
+        Abre una conexión psycopg2 usando self.db_url.
 
         Returns:
-            Conexión psycopg2 lista para ejecutar queries y COPY.
+            Conexión psycopg2.
 
         Raises:
-            RuntimeError: si db_url no fue inicializado.
+            RuntimeError: si load_env() no se llamó antes.
         """
         if not self.db_url:
             raise RuntimeError("db_url no inicializado. Llama primero a load_env().")
@@ -171,19 +216,16 @@ class MLPipeline:
 
     def test_connection(self) -> None:
         """
-        Verifica la conectividad a la base en Supabase con una consulta liviana.
-
-        Qué valida:
-        - DNS/host/puerto correctos
-        - credenciales válidas
-        - sesión estable para ejecutar operaciones posteriores
+        Verifica la conectividad a Supabase/Postgres ejecutando una query liviana.
 
         Imprime:
-        - host y puerto
-        - usuario actual, puerto servidor y timestamp (now())
+        - Host y puerto del servidor
+        - Usuario actual
+        - Puerto del servidor
+        - Timestamp actual
 
         Raises:
-            RuntimeError: si db_url no fue inicializado.
+            RuntimeError: si db_url no está inicializado.
         """
         if not self.db_url:
             raise RuntimeError("db_url no inicializado. Llama primero a load_env().")
@@ -198,47 +240,41 @@ class MLPipeline:
         cur.close()
         conn.close()
 
-    # H2O 
+    # -----------------------------
+    # H2O
+    # -----------------------------
     def h2o_start(self) -> None:
         """
         Inicia el cluster local de H2O.
 
-        Notas:
-        - H2O gestiona su propio backend (memoria + posible spill a disco).
-        - max_mem_size controla el presupuesto de memoria del cluster.
+        Configuración:
         - nthreads=-1 usa todos los hilos disponibles.
-
-        Esto es clave para trabajar con datasets grandes sin depender
-        de que todo quepa en memoria del proceso Python.
+        - max_mem_size limita el uso de memoria por el cluster (cfg.h2o_max_mem).
         """
         h2o.init(nthreads=-1, max_mem_size=self.cfg.h2o_max_mem)
 
-    #  Chunk query (keyset by sale_id) 
+    # -----------------------------
+    # Extracción por chunks (keyset pagination)
+    # -----------------------------
     def _build_chunk_query(self, last_sale_id: int) -> str:
         """
-        Construye un SELECT paginado por keyset usando sale_id (PK).
+        Construye un SELECT paginado por keyset usando la PK (sale_id).
 
-        Estrategia:
-        - Keyset pagination (recomendada en grandes volúmenes)
-        - Condición: sale_id > last_sale_id
-        - Orden: ORDER BY sale_id
-        - Límite: LIMIT chunk_size
+        Estrategia (keyset pagination):
+        - WHERE sale_id > last_sale_id
+        - ORDER BY sale_id
+        - LIMIT chunk_size
 
-        Ventaja sobre OFFSET:
-        - OFFSET se vuelve progresivamente más lento a offsets grandes.
-        - Keyset aprovecha el índice de la PK y mantiene rendimiento estable.
+        Ventaja:
+        - Escala mucho mejor que OFFSET para millones de filas.
 
         Args:
-            last_sale_id: último sale_id procesado; el siguiente chunk empieza después de este valor.
+            last_sale_id: último sale_id procesado.
 
         Returns:
-            Query SQL (string) lista para envolver en COPY(...).
-
-        Seguridad:
-        - forzamos int(last_sale_id) para asegurar que sea numérico y evitar inyección.
+            Query SQL lista para envolver en COPY(...).
         """
         last_sale_id = int(last_sale_id)
-
         cols = ", ".join(self.cfg.select_cols)
         pk = self.cfg.pk_col
         where = self.cfg.where_filters.strip()
@@ -254,24 +290,20 @@ class MLPipeline:
 
     def export_chunk_to_csv(self, conn, last_sale_id: int, csv_path: str) -> int:
         """
-        Exporta un chunk desde Supabase a CSV usando COPY TO STDOUT.
-
-        Por qué COPY:
-        - Es el método más eficiente en Postgres para exportar grandes volúmenes.
-        - Evita traer fila por fila vía cursor normal.
+        Exporta un chunk a CSV usando COPY TO STDOUT (rápido y eficiente en Postgres).
 
         Flujo:
-        1) Genera el SELECT paginado (keyset).
-        2) Ejecuta: COPY (SELECT...) TO STDOUT WITH CSV HEADER.
-        3) Cuenta filas del CSV (restando header) para saber si hay más datos.
+        - Genera el SELECT paginado.
+        - Ejecuta COPY (SELECT ...) TO STDOUT WITH CSV HEADER.
+        - Cuenta filas del archivo resultante (sin cargar todo en memoria).
 
         Args:
             conn: conexión psycopg2 abierta.
-            last_sale_id: cursor de paginación.
-            csv_path: ruta del archivo CSV temporal.
+            last_sale_id: cursor keyset.
+            csv_path: ruta del CSV temporal.
 
         Returns:
-            Número de filas exportadas (sin incluir el header).
+            Cantidad de filas exportadas (sin header).
         """
         query = self._build_chunk_query(last_sale_id)
         copy_sql = f"COPY ({query}) TO STDOUT WITH CSV HEADER"
@@ -279,28 +311,25 @@ class MLPipeline:
         with conn.cursor() as cur, open(csv_path, "w", encoding="utf-8", newline="") as f:
             cur.copy_expert(copy_sql, f)
 
-        # contar filas (sin cargar dataset completo)
         with open(csv_path, "r", encoding="utf-8") as f:
             nrows = sum(1 for _ in f) - 1
         return max(nrows, 0)
 
     def get_last_sale_id_from_csv(self, csv_path: str) -> int:
         """
-        Obtiene el mayor sale_id exportado en el chunk actual.
+        Obtiene el mayor sale_id exportado en el CSV del chunk.
 
-        Idea:
-        - Como el SELECT se exporta con ORDER BY sale_id,
-          la última fila del CSV tiene el mayor sale_id.
-        - Esto permite avanzar el cursor de paginación sin hacer consultas extra.
+        Como el SELECT se exporta ordenado (ORDER BY sale_id),
+        la última fila del CSV contiene el sale_id máximo del chunk.
 
         Args:
-            csv_path: CSV temporal exportado del chunk.
+            csv_path: ruta al CSV temporal.
 
         Returns:
-            El sale_id máximo del chunk; si el chunk está vacío, retorna -1.
+            sale_id máximo del chunk (int). Si el archivo está vacío, retorna -1.
 
         Raises:
-            RuntimeError: si la columna PK no existe en el header del CSV.
+            RuntimeError: si pk_col no está en el header.
         """
         with open(csv_path, "r", encoding="utf-8") as f:
             header = f.readline().strip().split(",")
@@ -314,39 +343,31 @@ class MLPipeline:
 
         if not last_line:
             return -1
-
         return int(last_line.strip().split(",")[pk_idx])
 
     def append_chunk_to_h2o(self, csv_path: str) -> None:
         """
-        Importa un CSV chunk a H2O y lo concatena al H2OFrame acumulado (self.hf).
+        Importa un CSV temporal a H2O y lo concatena al H2OFrame acumulado.
 
-        Implementación:
-        - h2o.import_file(csv_path) crea un H2OFrame del chunk.
-        - rbind concatena filas (append vertical).
-
-        Nota:
-        - self.hf vive dentro del cluster H2O y puede gestionar datasets grandes.
+        Args:
+            csv_path: ruta al CSV temporal exportado desde Postgres.
         """
         hf_chunk = h2o.import_file(csv_path)
         self.hf = hf_chunk if self.hf is None else self.hf.rbind(hf_chunk)
 
     def load_frame_in_chunks(self) -> None:
         """
-        Construye self.hf trayendo datos desde Supabase por chunks (batch ingestion).
+        Construye self.hf trayendo datos por chunks desde Supabase/Postgres.
 
-        Enfoque:
-        - Genera CSVs temporales por chunk (en un directorio temporal).
-        - Cada CSV se importa a H2O inmediatamente y se concatena.
-        - No se crea un CSV final gigante en disco local.
+        Implementación:
+        - Crea un directorio temporal.
+        - Exporta chunks a CSV temporales (COPY).
+        - Importa cada CSV a H2O y concatena.
+        - El directorio temporal se borra al finalizar.
 
-        Beneficios (optimización de proceso):
-        - Reduce el uso de almacenamiento local (archivos temporales que se eliminan).
-        - Evita el overhead de manejar un artefacto grande persistente.
-        - Mantiene extracción eficiente gracias a keyset pagination por sale_id.
-
-        Estado:
-        - last_sale_id actúa como cursor y se actualiza con el máximo sale_id del chunk.
+        Efecto:
+        - Evita generar un CSV único gigante en disco local.
+        - Mantiene extracción estable para grandes volúmenes usando keyset pagination.
         """
         conn = self._connect()
         last_sale_id = self.cfg.start_sale_id
@@ -377,22 +398,19 @@ class MLPipeline:
         finally:
             conn.close()
 
-    # Feature engineering 
+    # -----------------------------
+    # Feature engineering
+    # -----------------------------
     def add_log_target(self) -> None:
         """
-        Crea el target en escala logarítmica: saleamount_log = log(saleamount + 1).
+        Crea el target logarítmico: saleamount_log = log(saleamount + 1).
 
-        Motivación (optimización de modelo):
-        - Los precios inmobiliarios suelen ser altamente asimétricos (colas largas).
-        - El log reduce la influencia de outliers y estabiliza la varianza.
-        - Mejora la estabilidad de métricas tipo RMSE/MAE y la generalización.
-
-        Nota:
-        - Se usa +1 para evitar log(0).
-        - El entrenamiento/evaluación se realiza en escala log.
+        Motivo:
+        - Reduce asimetría y el impacto de outliers en precios inmobiliarios.
+        - Suele estabilizar el entrenamiento y mejorar generalización.
 
         Raises:
-            RuntimeError: si self.hf aún no fue construido.
+            RuntimeError: si self.hf no existe.
         """
         if self.hf is None:
             raise RuntimeError("No hay H2OFrame. Llama primero a load_frame_in_chunks().")
@@ -401,14 +419,13 @@ class MLPipeline:
 
     def cast_categoricals(self) -> None:
         """
-        Convierte columnas categóricas a factor dentro de H2O.
+        Convierte columnas categóricas a factor (tipo categoría) en H2O.
 
-        Motivación:
-        - Evita que H2O interprete categorías como numéricas.
-        - Permite que AutoML aplique estrategias adecuadas para categóricas.
+        Motivo:
+        - Asegura que H2O trate estas columnas como categorías y no como numéricas.
 
-        Columnas a convertir:
-        - propertytype, residentialtype
+        Raises:
+            RuntimeError: si self.hf no existe.
         """
         if self.hf is None:
             raise RuntimeError("No hay H2OFrame.")
@@ -416,18 +433,19 @@ class MLPipeline:
             if c in self.hf.columns:
                 self.hf[c] = self.hf[c].asfactor()
 
-    # Split / Train / Eval 
+    # -----------------------------
+    # Split / Train / Eval
+    # -----------------------------
     def split(self) -> None:
         """
-        Divide el H2OFrame en train/valid/test con proporciones fijas y seed.
+        Divide el dataset en train/valid/test según cfg.split_train_valid y cfg.seed.
 
-        Implementación:
-        - split_frame([train_ratio, valid_ratio], seed=seed)
-        - test queda como el residual (1 - train - valid)
+        - train_ratio = split_train_valid[0]
+        - valid_ratio = split_train_valid[1]
+        - test_ratio  = residual
 
-        Motivación:
-        - Validación separada para AutoML (selección de modelos).
-        - Test independiente para reportar performance final.
+        Raises:
+            RuntimeError: si self.hf no existe.
         """
         if self.hf is None:
             raise RuntimeError("No hay H2OFrame.")
@@ -436,20 +454,14 @@ class MLPipeline:
 
     def train_automl(self) -> None:
         """
-        Entrena H2O AutoML sobre el target log usando train/valid.
-
-        Configuración:
-        - max_models: limita cantidad de modelos (control de tiempo y complejidad).
-        - max_runtime_secs: límite duro de tiempo.
-        - sort_metric: RMSE (en el target log), para ordenar/seleccionar.
-
-        Importante:
-        - x = features definidas en config (NO incluye sale_id).
-        - y = saleamount_log (target transformado).
+        Entrena H2OAutoML sobre train y usa valid para selección/early-stopping.
 
         Resultado:
-        - self.aml guarda el objeto AutoML (leaderboard + modelos).
-        - self.leader guarda el mejor modelo según la métrica.
+        - self.aml: objeto AutoML con leaderboard y modelos entrenados.
+        - self.leader: mejor modelo (según cfg.sort_metric) en valid.
+
+        Raises:
+            RuntimeError: si train/valid no existen.
         """
         if self.train is None or self.valid is None:
             raise RuntimeError("Splits no creados. Llama primero a split().")
@@ -461,8 +473,8 @@ class MLPipeline:
             sort_metric=self.cfg.sort_metric,
         )
         self.aml.train(
-            x=list(self.cfg.features),      # NO incluye sale_id
-            y=self.cfg.target_log,          # target log
+            x=list(self.cfg.features),  # NO incluye sale_id
+            y=self.cfg.target_log,      # target log
             training_frame=self.train,
             validation_frame=self.valid,
         )
@@ -470,18 +482,18 @@ class MLPipeline:
 
     def evaluate(self) -> Dict[str, float]:
         """
-        Evalúa el modelo líder en el set de test (en escala log).
+        Evalúa el modelo líder en test y devuelve métricas en escala log.
 
         Métricas:
-        - RMSE: penaliza errores grandes; útil para comparar modelos.
-        - MAE: más robusto; error medio absoluto.
-        - R2: proporción de varianza explicada (en escala log).
+        - RMSE
+        - MAE
+        - R2
 
         Returns:
-            Dict con rmse/mae/r2.
+            dict con keys: rmse, mae, r2
 
         Raises:
-            RuntimeError: si leader o test no están listos.
+            RuntimeError: si leader o test no existen.
         """
         if self.leader is None or self.test is None:
             raise RuntimeError("Leader/Test no listos.")
@@ -496,37 +508,45 @@ class MLPipeline:
 
     def show_leaderboard(self, top_n: int = 10) -> None:
         """
-        Imprime el leaderboard de AutoML (top_n modelos).
+        Imprime por consola el leaderboard (top_n modelos) de AutoML.
 
-        Útil para:
-        - comparar familias (GBM, ensembles, etc.)
-        - justificar por qué el leader es el mejor bajo la métrica elegida
+        Args:
+            top_n: número de filas a mostrar.
+
+        Raises:
+            RuntimeError: si AutoML no fue entrenado.
         """
         if self.aml is None:
             raise RuntimeError("AutoML no entrenado.")
         print(self.aml.leaderboard.head(rows=top_n))
 
-    def plot_pred_vs_true_log(self, alpha: float = 0.15) -> None:
+    # -----------------------------
+    # Artefactos: plots + varimp
+    # -----------------------------
+    def plot_pred_vs_true_log(self, alpha: float = 0.15, save: bool = True) -> None:
         """
-        Scatter plot de Predicción vs Real en escala log, con línea y=x.
+        Genera un scatter plot de predicción vs real (escala log) y opcionalmente lo guarda.
 
         Objetivo:
-        - Diagnóstico visual rápido de calibración:
-          si el modelo está bien calibrado, los puntos se agrupan alrededor de la diagonal.
-        - Detectar sesgos sistemáticos (sobre/infra-predicción).
+        - Diagnóstico visual de calibración del modelo (ideal: puntos cerca de y=x).
+        - Detectar sesgos de sobre/infra-predicción.
 
         Args:
             alpha: transparencia de los puntos (útil con muchos registros).
+            save: si True, guarda PNG en cfg.output_dir.
 
         Raises:
-            RuntimeError: si leader o test no están listos.
+            RuntimeError: si leader o test no existen.
         """
         if self.leader is None or self.test is None:
             raise RuntimeError("Leader/Test no listos.")
 
         pred = self.leader.predict(self.test)
-        y_true = self.test[self.cfg.target_log].as_data_frame(use_pandas=True).iloc[:, 0].to_numpy()
-        y_pred = pred["predict"].as_data_frame(use_pandas=True).iloc[:, 0].to_numpy()
+        y_true_df = self.test[self.cfg.target_log].as_data_frame(use_pandas=True)
+        y_pred_df = pred["predict"].as_data_frame(use_pandas=True)
+
+        y_true = np.asarray(y_true_df[self.cfg.target_log]).astype(float)
+        y_pred = np.asarray(y_pred_df["predict"]).astype(float)
 
         plt.figure()
         plt.scatter(y_true, y_pred, alpha=alpha)
@@ -536,24 +556,32 @@ class MLPipeline:
         plt.xlabel("Real (log)")
         plt.ylabel("Predicción (log)")
         plt.title("Predicción vs Real (escala log)")
+
+        if save:
+            fig_path = self._artifact_path("pred_vs_real_log.png")
+            plt.savefig(fig_path, dpi=200, bbox_inches="tight")
+            print("Guardado:", fig_path)
+
         plt.show()
+        plt.close()
 
-    def best_gbm_varimp(self) -> None:
+    def best_gbm_varimp(self, save: bool = True) -> None:
         """
-        Encuentra el mejor modelo GBM dentro del leaderboard y muestra su importancia de variables.
+        Busca el mejor GBM en el leaderboard y extrae su importancia de variables.
 
-        Por qué GBM y no el leader:
+        Motivo:
         - El leader puede ser un StackedEnsemble (menos interpretable).
-        - Un GBM top suele ser casi igual de performante y mucho más interpretable.
+        - Un GBM top suele ser similar en performance y más interpretable.
 
-        Flujo:
-        1) Convierte leaderboard a dataframe.
-        2) Filtra model_id que contienen "GBM".
-        3) Toma el primero (mejor GBM según sort_metric).
-        4) Imprime varimp y grafica varimp_plot().
+        Guardado:
+        - CSV con tabla de importancias (si save=True).
+        - PNG con el varimp_plot (si save=True).
 
-        Nota:
-        - varimp depende del tipo de modelo; GBM lo soporta bien.
+        Args:
+            save: si True, guarda CSV y PNG en cfg.output_dir.
+
+        Raises:
+            RuntimeError: si AutoML no fue entrenado.
         """
         if self.aml is None:
             raise RuntimeError("AutoML no entrenado.")
@@ -570,28 +598,84 @@ class MLPipeline:
         print("Best GBM:", best_gbm_id)
         vi = best_gbm.varimp(use_pandas=True)
         print(vi)
+
+        if save:
+            csv_path = self._artifact_path(f"varimp_{best_gbm_id}.csv")
+            vi.to_csv(csv_path, index=False)
+            print("Guardado:", csv_path)
+
         best_gbm.varimp_plot()
 
-    # Orchestrator 
+        if save:
+            png_path = self._artifact_path(f"varimp_{best_gbm_id}.png")
+            plt.savefig(png_path, dpi=200, bbox_inches="tight")
+            print("Guardado:", png_path)
+
+        plt.show()
+        plt.close()
+
+    # -----------------------------
+    # Guardado de resultados
+    # -----------------------------
+    def save_results(self, metrics: Dict[str, float]) -> None:
+        """
+        Guarda resultados del pipeline en cfg.output_dir para ejecución desde terminal.
+
+        Artefactos:
+        - metrics.json: métricas finales en test.
+        - leaderboard.csv: ranking completo de modelos de AutoML.
+        - leader model: serialización del modelo ganador con h2o.save_model().
+
+        Args:
+            metrics: diccionario con métricas (rmse/mae/r2).
+        """
+        self._ensure_output_dir()
+
+        # metrics.json
+        metrics_path = self._artifact_path("metrics.json")
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        print("Guardado:", metrics_path)
+
+        # leaderboard.csv
+        if self.aml is not None:
+            lb_df = self.aml.leaderboard.as_data_frame()
+            lb_path = self._artifact_path("leaderboard.csv")
+            lb_df.to_csv(lb_path, index=False)
+            print("Guardado:", lb_path)
+
+        # leader model (H2O)
+        if self.leader is not None:
+            model_path = h2o.save_model(
+                model=self.leader,
+                path=self.cfg.output_dir,
+                force=True,
+            )
+            print("Guardado leader model en:", model_path)
+
+    # -----------------------------
+    # Orchestrator
+    # -----------------------------
     def run(self) -> Dict[str, float]:
         """
-        Ejecuta el pipeline completo de manera determinista (end-to-end).
+        Ejecuta el pipeline completo (end-to-end) en orden determinista.
 
-        Orden:
-        1) load_env()          -> carga DATABASE_URL desde .env
-        2) test_connection()   -> sanity check de conectividad a Supabase
-        3) h2o_start()         -> inicia cluster local de H2O
-        4) load_frame_in_chunks() -> ingesta incremental desde Postgres en batches (keyset)
-        5) add_log_target()    -> crea target log para estabilizar distribución
-        6) cast_categoricals() -> convierte categóricas a factor
-        7) split()             -> train/valid/test
-        8) train_automl()      -> entrena AutoML
-        9) evaluate()          -> métricas en test
-        10) show_leaderboard() -> top modelos
-        11) plot_pred_vs_true_log() y best_gbm_varimp() como diagnóstico
+        Flujo:
+        1) load_env()            -> lee DATABASE_URL desde .env
+        2) test_connection()     -> valida conexión a Supabase/Postgres
+        3) h2o_start()           -> inicia el cluster H2O
+        4) load_frame_in_chunks()-> extrae dataset por chunks y lo carga a H2OFrame
+        5) add_log_target()      -> crea variable objetivo logarítmica
+        6) cast_categoricals()   -> castea columnas categóricas a factor
+        7) split()               -> genera train/valid/test
+        8) train_automl()        -> entrena AutoML y define leader
+        9) evaluate()            -> evalúa en test y devuelve métricas
+        10) show_leaderboard()   -> imprime top modelos
+        11) plot_pred_vs_true_log() + best_gbm_varimp() -> diagnósticos y guardado de figuras
+        12) save_results()       -> persistencia de métricas/leaderboard/modelo a disco
 
         Returns:
-            Diccionario con métricas de test (rmse/mae/r2).
+            Diccionario con métricas finales (rmse/mae/r2).
         """
         self.load_env()
         self.test_connection()
@@ -608,24 +692,24 @@ class MLPipeline:
         metrics = self.evaluate()
         self.show_leaderboard(top_n=10)
 
-        # extras (comenta si querés)
-        # self.leader.explain(self.test)
-        self.plot_pred_vs_true_log()
-        self.best_gbm_varimp()
+        self.plot_pred_vs_true_log(alpha=0.15, save=True)
+        self.best_gbm_varimp(save=True)
 
+        self.save_results(metrics)
         return metrics
 
 
 def main() -> None:
     """
-    Entry point para ejecución como script.
+    Entry point para ejecución como script desde terminal.
 
-    Permite correr:
+    Uso:
         python ml_pipeline_supabase_h2o_class.py
 
-    Nota:
-    - Mantener chunk_size en config para controlar tiempo de extracción.
-    - Si querés pruebas rápidas, podés reducir chunk_size o cortar ingest en load_frame_in_chunks().
+    Ajustes comunes:
+    - Reducir chunk_size para pruebas rápidas.
+    - Aumentar max_runtime_secs / max_models para búsquedas más amplias.
+    - Cambiar output_dir para separar ejecuciones.
     """
     cfg = PipelineConfig(chunk_size=100_000)
     pipe = MLPipeline(cfg)
