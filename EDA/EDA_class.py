@@ -11,6 +11,8 @@ class EDA:
         self.num_cols: list[str] = []
         self.cat_cols: list[str] = []
 
+## EXPLORACION Y LIMPIEZA INICIAL
+##  Enfocada en revisar nulos, crear features de fecha y construir listas de columnas numéricas y categóricas para análisis posteriores.
     def explorar(self, head_n: int = 5):
         """Exploración inicial: shape, head y describe del df."""
         print("shape:", self.df.shape)
@@ -34,7 +36,7 @@ class EDA:
         ])
         self.df = self.df.filter(pl.col("salesratio").is_not_null() & pl.col("daterecorded").is_not_null())
         return self
-
+## Agrega features de año y mes (numérico y categórico abreviado) a partir de la fecha, eliminando columnas previas de mes si existieran.
     def add_date_features(
         self,
         date_col: str = "daterecorded",
@@ -55,7 +57,8 @@ class EDA:
         )
         self.df = self.df.drop(drop_prev_month_cols, strict=False).rename({"sale_month_name": month_name})
         return self
-
+    
+# Construye listas de columnas numéricas y categóricas según el schema del df, para facilitar análisis posteriores, aquí se excluyeron las fechas ya que fueron tratadas en el método anterior.
     def build_schema_lists(self):
         """Construye listas de columnas según tipo."""
         schema = self.df.schema
@@ -69,7 +72,8 @@ class EDA:
     def get(self) -> pl.DataFrame:
         return self.df
 
-    # ===============   ANÁLISIS DESCRIPTIVO   =============
+##  ANÁLISIS DESCRIPTIVO Y VISUALIZACIÓNES
+## Basado en métodos para describir numéricas, frecuencias de categóricas, correlaciones y visualizaciones como histogramas, boxplots y QQ-plots, con opciones para log-transformaciones y análisis por categorías.
     def qqplot(self, col: str, log: bool = False):
         """QQ-plot de una columna; opción log1p."""
         x = self.df[col].drop_nulls().to_numpy()
@@ -138,6 +142,7 @@ class EDA:
         plt.yscale("log"); plt.xticks(rotation=45, ha="right")
         plt.tight_layout(); plt.show()
 
+# Un método final para describir la variable objetivo, mostrando describe, std y var, además de un método para visualizarla con histogramas, boxplots y QQ-plot, tanto en general como por categorías de 'town'.
     def target_summary(self, col: str):
         """Describe, std y var de la variable objetivo."""
         print(self.df.select(pl.col(col)).describe())
@@ -151,7 +156,8 @@ class EDA:
         self.hist_box_by_cat(col, "town")
         self.bar_by_cat(col, "town")
 
-    # ===============   NUMÉRICAS   =============
+## Numéricas:
+## - nums_select: devuelve lista de columnas numéricas excluyendo las indicadas.
     def nums_select(self, exclude: list[str] = None) -> list[str]:
         """Para los datos numéricos del df, devuelve lista de columnas excluyendo las indicadas."""
         if exclude is None:
@@ -162,7 +168,6 @@ class EDA:
             schema = self.df.schema
             cols = [c for c, dt in schema.items() if dt in (pl.Int64, pl.Float64, pl.Int32) and c not in exclude]
         return cols
-
     def nums_describe(self, exclude: list[str] = None) -> pl.DataFrame:
         """Describe de las columnas numéricas seleccionadas, quitando el sale_id."""
         if exclude is None:
@@ -186,7 +191,7 @@ class EDA:
         for c in cols:
             long_rows.append((c, stats_row[f"{c}__std"][0], stats_row[f"{c}__var"][0]))
         return pl.DataFrame(long_rows, schema=["col", "std", "var"]).sort("std", descending=True)
-
+## Funcion enfocada en permitirnos tener una visión global de la relación entre cada variable numérica y el target, mostrando la correlación ordenada por su valor absoluto para identificar rápidamente cuáles podrían ser las más relevantes para análisis posteriores o modelado.
     def corr_vs_target(self, target: str, num_cols: list[str] | None = None) -> pl.DataFrame:
         "Hace una correlacion de cada numérica vs el target y devuelve un df ordenado por valor absoluto de correlación."
         if num_cols is None:
@@ -199,7 +204,8 @@ class EDA:
         melted = corr_row.melt(variable_name="feature", value_name="corr")
         return melted.sort("corr", descending=True)
 
-    # ===============   CATEGÓRICAS   =============
+## CATEGÓRICAS
+## - freq_tables: imprime tabla de frecuencias  para cada categórica; salta binarias ne caso de haber (aunque no hubo relmaente)
     def freq_tables(self, cat_cols):
         """Imprime tabla de frecuencias (obs y %) para cada categórica; salta binarias."""
         for c in cat_cols:
@@ -214,13 +220,15 @@ class EDA:
             print(f"\n {c} ({n} categorías)")
             print(tab)
 
+## Para analizar las relaciones entre la variable objetivo y la categporica
     def cat_vs_target_plots(self, target: str, cat: str, top: int = 10):
         """Hist+box (log1p) por categoría y barplot (media target, y log)."""
         print(f"\n=== {cat} vs {target} ===")
         self.hist_box_by_cat(y=target, cat=cat, top=top)
         self.bar_by_cat(y=target, cat=cat, top=top)
 
-    # ===============   CORRELACIÓN   =============
+#CORRELACIONES
+## Enfocada en las variables numéricas y su relación entre sí (ya que la numérica vs target se ve en el método anterior), con opciones para elegir en nu método anterior)
     def corr_matrix(self, num_cols, method: str = "pearson"):
         """Matriz de correlación vía pandas.corr()."""
         return self.df.select(num_cols).to_pandas().corr(method=method)
