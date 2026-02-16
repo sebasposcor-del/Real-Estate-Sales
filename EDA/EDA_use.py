@@ -8,29 +8,37 @@ from dotenv import load_dotenv, find_dotenv
 import psycopg2
 from urllib.parse import urlparse
 
+
+import os
+from urllib.parse import urlparse
+
+import polars as pl
+from dotenv import load_dotenv, find_dotenv
+from sqlalchemy import create_engine
+
 SQL_DEFAULT = """
 SELECT *
-FROM ml_table
-LIMIT 10000;
+FROM ml_table;
 """
 
-
-
-
-
 def load_df_from_sql(sql: str = SQL_DEFAULT) -> pl.DataFrame:
-    load_dotenv(find_dotenv(), override=True)
+    env_path = find_dotenv(usecwd=True)
+    load_dotenv(env_path, override=True)
+
     url = os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("Falta DATABASE_URL en .env")
 
-    conn = psycopg2.connect(url, options="-c statement_timeout=480000")  # 180s
-    cur = conn.cursor()
-    cur.execute(sql)
-    rows = cur.fetchall()
-    cols = [d[0] for d in cur.description]
-    cur.close(); conn.close()
-    return pl.DataFrame(rows, schema=cols)
+    p = urlparse(url)
+    host = p.hostname or "?"
+    port = p.port or "?"
+    print(f"Conectando a: {host}:{port}")
+    engine = create_engine(url)
+
+    df = pl.read_database(sql, engine)
+
+    engine.dispose()
+    return df
 
 def load_df_from_parquet(path: str) -> pl.DataFrame:
     return pl.read_parquet(path)
