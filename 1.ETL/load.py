@@ -140,7 +140,40 @@ class Load:
         self.conn.commit()
         print("✔ d_property cargada")
 
+    # ===================================================================
+    # Town
+    def load_town(self, df: pl.DataFrame):
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS d_town(
+                    town_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    town TEXT UNIQUE NOT NULL
+                );
+            """)
 
+            buf = io.StringIO()
+            df.select("town").unique().write_csv(buf, include_header=False)
+            buf.seek(0)
+
+            cur.execute("DROP TABLE IF EXISTS tmp_town;")
+            cur.execute("""
+                CREATE TEMP TABLE tmp_town (
+                    town TEXT
+                ) ON COMMIT DROP;
+            """)
+
+            cur.copy_from(buf, 'tmp_town', columns=('town',), sep=',')
+
+            cur.execute("""
+                INSERT INTO d_town (town)
+                SELECT DISTINCT town
+                FROM tmp_town
+                WHERE town IS NOT NULL AND town <> ''
+                ON CONFLICT (town) DO NOTHING;
+            """)
+
+        self.conn.commit()
+        print("d_town cargada")
     # ==========================================================
     # Fact Sales
 
