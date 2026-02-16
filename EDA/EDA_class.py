@@ -153,6 +153,7 @@ class EDA:
 
     # ===============   NUMÉRICAS   =============
     def nums_select(self, exclude: list[str] = None) -> list[str]:
+        """Para los datos numéricos del df, devuelve lista de columnas excluyendo las indicadas."""
         if exclude is None:
             exclude = []
         if getattr(self, "num_cols", None):
@@ -163,6 +164,7 @@ class EDA:
         return cols
 
     def nums_describe(self, exclude: list[str] = None) -> pl.DataFrame:
+        """Describe de las columnas numéricas seleccionadas, quitando el sale_id."""
         if exclude is None:
             exclude = ["sale_id"]
         cols = self.nums_select(exclude=exclude)
@@ -171,6 +173,7 @@ class EDA:
         return self.df.select([pl.col(c) for c in cols]).describe()
 
     def nums_std_var(self, exclude: list[str] = None) -> pl.DataFrame:
+        """Calcula std y var de las columnas numéricas seleccionadas, ordenando por std descendente."""
         if exclude is None:
             exclude = ["sale_id"]
         cols = self.nums_select(exclude=exclude)
@@ -185,6 +188,7 @@ class EDA:
         return pl.DataFrame(long_rows, schema=["col", "std", "var"]).sort("std", descending=True)
 
     def corr_vs_target(self, target: str, num_cols: list[str] | None = None) -> pl.DataFrame:
+        "Hace una correlacion de cada numérica vs el target y devuelve un df ordenado por valor absoluto de correlación."
         if num_cols is None:
             num_cols = self.nums_select(exclude=[])
         cols = [c for c in num_cols if c != target]

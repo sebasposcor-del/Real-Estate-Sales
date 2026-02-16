@@ -22,6 +22,7 @@ FROM ml_table;
 """
 
 def load_df_from_sql(sql: str = SQL_DEFAULT) -> pl.DataFrame:
+    """Carga de datos desde SQL usando SQLAlchemy y Polars."""
     env_path = find_dotenv(usecwd=True)
     load_dotenv(env_path, override=True)
 
@@ -96,3 +97,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
