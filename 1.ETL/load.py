@@ -399,6 +399,44 @@ class Load:
             cur.execute("SELECT COUNT(*) FROM ML_Table;")
             print(" ML_Table cargada. Filas:", cur.fetchone()[0])
 
+    # ======================================================
+    ## Constrains
+
+    def create_foreign_keys(self):
+        try:
+            with self.conn.cursor() as cur:
+
+                # d_property -> d_town
+                cur.execute("""
+                    ALTER TABLE d_property
+                    ADD CONSTRAINT fk_property_town
+                    FOREIGN KEY (town_id)
+                    REFERENCES d_town(town_id);
+                """)
+
+                # f_sales -> d_property
+                cur.execute("""
+                    ALTER TABLE f_sales
+                    ADD CONSTRAINT fk_sales_property
+                    FOREIGN KEY (property_id)
+                    REFERENCES d_property(property_id);
+                """)
+
+                # f_sales -> d_non_use_code
+                cur.execute("""
+                    ALTER TABLE f_sales
+                    ADD CONSTRAINT fk_sales_nonusecode
+                    FOREIGN KEY (nonusecode_id)
+                    REFERENCES d_non_use_code(nonusecode_id);
+                """)
+
+            self.conn.commit()
+            print("Foreign Keys creadas correctamente")
+
+        except Exception as e:
+            self.conn.rollback()
+            print(" Error creando Foreign Keys:", e)
+
 
     # ==========================================================
     # definir orquestador
