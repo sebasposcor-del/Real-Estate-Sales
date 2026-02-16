@@ -9,7 +9,7 @@ class Load:
 
     def __init__(self):
         self.conn = self.get_connection()
-        print("✅ Conexión establecida con Postgres")
+        print("Conexión establecida con Postgres")
 
     # Conexión
     def get_connection(self):
@@ -143,6 +143,7 @@ class Load:
     # ===================================================================
     # Town
     def load_town(self, df: pl.DataFrame):
+        """Carga la dimensión d_town con un proceso robusto para texto y caracteres especiales."""
         with self.conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS d_town(
@@ -174,6 +175,63 @@ class Load:
 
         self.conn.commit()
         print("d_town cargada")
+
+    # ====================================================
+    # Sales Notes
+    def load_sale_notes(self, sale_notes: pl.DataFrame):
+        """Carga la dimensión d_sale_notes con un proceso robusto para texto largo y caracteres especiales."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS d_sale_notes (
+                note_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                serialnumber TEXT,
+                remarks TEXT,
+                opm_remarks TEXT
+                );
+            """)
+
+            df = sale_notes.select([
+                "serialnumber",
+                "remarks",
+                "opm_remarks"
+            ]).unique()
+
+            buf = io.StringIO()
+            df.write_csv(buf, include_header=False)
+            buf.seek(0)
+
+            #  Tabla temporal
+            cur.execute("""
+                CREATE TEMP TABLE tmp_sale_notes (
+                    serialnumber TEXT,
+                    remarks TEXT,
+                    opm_remarks TEXT
+                ) ON COMMIT DROP;
+            """)
+
+            cur.copy_expert(
+                "COPY tmp_sale_notes (serialnumber, remarks, opm_remarks) "
+                "FROM STDIN WITH (FORMAT CSV)",
+                buf
+            )
+
+            # Insert final
+            cur.execute("""
+                INSERT INTO d_sale_notes (serialnumber, remarks, opm_remarks)
+                SELECT DISTINCT
+                    serialnumber,
+                    remarks,
+                    opm_remarks
+                FROM tmp_sale_notes
+                WHERE serialnumber IS NOT NULL AND serialnumber <> '';
+            """)
+
+            self.conn.commit()
+
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM d_sale_notes;")
+                print("✔ d_sale_notes cargada. Filas:", cur.fetchone()[0])
+
     # ==========================================================
     # Fact Sales
 
@@ -228,7 +286,6 @@ class Load:
                 FROM STDIN WITH (FORMAT CSV)
             """, buf)
 
-            # Insert fact
             cur.execute("""
                 INSERT INTO f_sales (
                     serialnumber, listyear, daterecorded,
@@ -255,6 +312,92 @@ class Load:
 
         self.conn.commit()
         print("✔ f_sales cargada")
+    # ======================================================
+    #ML Table
+    def load_ml_table(self):
+        with self.conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS ML_Table (
+                sale_id         BIGINT PRIMARY KEY,
+                serialnumber    TEXT,
+                listyear        INT,
+                daterecorded    DATE,
+                assessedvalue   DOUBLE PRECISION,
+                saleamount      DOUBLE PRECISION,
+                salesratio      DOUBLE PRECISION,
+                address         TEXT,
+                propertytype    TEXT,
+                residentialtype TEXT,
+                latitude        DOUBLE PRECISION,
+                longitude       DOUBLE PRECISION,
+                town            TEXT,
+                nonusecode      TEXT,
+                remarks_all     TEXT,
+                opm_remarks_all TEXT
+                );
+            """)
+
+            cur.execute("""
+                WITH notes AS (
+                    SELECT
+                        serialnumber,
+                        STRING_AGG(remarks, ' | ' ORDER BY note_id)     AS remarks_all,
+                        STRING_AGG(opm_remarks, ' | ' ORDER BY note_id) AS opm_remarks_all
+                    FROM d_sale_notes
+                    GROUP BY serialnumber
+                )
+                INSERT INTO ML_Table (
+                    sale_id,
+                    serialnumber,
+                    listyear,
+                    daterecorded,
+                    assessedvalue,
+                    saleamount,
+                    salesratio,
+                    address,
+                    propertytype,
+                    residentialtype,
+                    latitude,
+                    longitude,
+                    town,
+                    nonusecode,
+                    remarks_all,
+                    opm_remarks_all
+                )
+                SELECT
+                    f.sale_id,
+                    f.serialnumber,
+                    f.listyear,
+                    f.daterecorded,
+                    f.assessedvalue,
+                    f.saleamount,
+                    f.salesratio,
+                    p.address,
+                    p.propertytype,
+                    p.residentialtype,
+                    p.latitude,
+                    p.longitude,
+                    t.town,
+                    n.nonusecode,
+                    notes.remarks_all,
+                    notes.opm_remarks_all
+                FROM f_sales AS f
+                JOIN d_property AS p
+                    ON p.property_id = f.property_id
+                JOIN d_town AS t
+                    ON t.town_id = p.town_id
+                LEFT JOIN d_non_use_code AS n
+                    ON n.nonusecode_id = f.nonusecode_id
+                LEFT JOIN notes
+                    ON notes.serialnumber = f.serialnumber
+                ON CONFLICT (sale_id) DO NOTHING;
+            """)
+
+        self.conn.commit()
+
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM ML_Table;")
+            print(" ML_Table cargada. Filas:", cur.fetchone()[0])
 
 
     # ==========================================================
